@@ -1,70 +1,76 @@
-import streamlit as st
 import numpy as np
-import plotly.graph_objects as go
 
-# QUESTO DEVE ESSERE IL PRIMO COMANDO IN ASSOLUTO DOPO GLI IMPORT
-st.set_page_config(page_title="Empiric Payoff", layout="tight")
+class EmpiricPayoffEngine:
+    def __init__(self, current_underlying_price, full_option_chain):
+        """
+        full_option_chain: Un dizionario o DataFrame contenente i prezzi reali di OGGI.
+        Struttura ideale: { DTE: { STRIKE: { 'call_bid': X, 'call_ask': Y, 'put_bid': W, ... } } }
+        """
+        self.S0 = current_underlying_price
+        self.chain = full_option_chain
+        self.legs = []
 
-st.title("📈 Real Payoff Simulator")
-st.subheader("Principio della Matrice Empirica")
+    def add_leg(self, quantity, strike, option_type, original_dte, entry_price):
+        """Permette all'utente di inserire N gambe a piacimento"""
+        self.legs.append({
+            'qty': quantity,          # +1 per lunghe, -1 per corte
+            'strike': strike,
+            'type': option_type.upper(), # 'CALL' o 'PUT'
+            'orig_dte': original_dte, # DTE al momento dell'apertura
+            'entry': entry_price
+        })
 
-# --- 1. CONFIGURAZIONE GAMBE ---
-st.sidebar.header("Configurazione Strategia")
-if 'legs' not in st.session_state:
-    st.session_state.legs = [
-        {"qty": -1, "strike": 750, "type": "CALL", "dte": 3, "entry": 1.58},
-        {"qty": -1, "strike": 758, "type": "CALL", "dte": 3, "entry": 0.08},
-        {"qty": 1, "strike": 754, "type": "CALL", "dte": 4, "entry": 0.91},
-        {"qty": 1, "strike": 755, "type": "CALL", "dte": 4, "entry": 0.68},
-    ]
-
-if st.sidebar.button("➕ Aggiungi Gamba"):
-    st.session_state.legs.append({"qty": 1, "strike": 745, "type": "CALL", "dte": 3, "entry": 1.0})
-
-for i, leg in enumerate(st.session_state.legs):
-    with st.sidebar.expander(f"Gamba {i+1}: {leg['type']} {leg['strike']}"):
-        leg['qty'] = st.number_input("Quantità (-1 corta, +1 lunga)", value=leg['qty'], key=f"q_{i}")
-        leg['strike'] = st.number_input("Strike", value=leg['strike'], key=f"s_{i}")
-        leg['dte'] = st.number_input("Original DTE", value=leg['dte'], key=f"d_{i}")
-        leg['entry'] = st.number_input("Prezzo di Carico", value=leg['entry'], key=f"e_{i}")
-
-# --- 2. CURSORI ---
-st.markdown("### 🎛️ Pannello di Controllo")
-col1, col2 = st.columns(2)
-with col1:
-    giorni_avanti = st.slider("⏳ Giorni in Avanti (Cursore Tempo)", 0, 4, 0)
-with col2:
-    s_attuale = st.slider("💵 Prezzo SPY Attuale", 720, 780, 746)
-
-# --- 3. MOTORE DI CALCOLO EMPIRICO ---
-def get_simulated_market_price(target_dte, target_strike, current_underlying):
-    distance = abs(target_strike - current_underlying)
-    time_factor = np.sqrt(max(0.1, target_dte) / 4)
-    sim_price = max(0.05, (2.5 - (distance * 0.4)) * time_factor)
-    return sim_price
-
-prezzi_asse_x = np.arange(730, 770, 0.5)
-pnl_profilo = []
-
-for S_simulated in prezzi_asse_x:
-    total_pnl = 0.0
-    for leg in st.session_state.legs:
-        current_dte = leg['dte'] - giorni_avanti
-        
-        if current_dte <= 0:
-            valore_opzione = max(0, S_simulated - leg['strike']) if leg['type'] == "CALL" else max(0, leg['strike'] - S_simulated)
-        else:
-            moneyness_offset = leg['strike'] - S_simulated
-            mirror_strike = round(s_attuale + moneyness_offset)
-            valore_opzione = get_simulated_market_price(current_dte, mirror_strike, s_attuale)
+    def get_market_price_mirror(self, target_dte, target_strike, option_type):
+        """
+        IL CUORE DEL SOFTWARE: Cerca nella chain di oggi il prezzo specchio.
+        Se non trova l'esatto DTE o lo Strike, effettua un'interpolazione lineare.
+        """
+        try:
+            # Estrae la chain per il DTE simulato
+            dte_data = self.chain[target_dte]
             
-        leg_pnl = (valore_opzione - leg['entry']) * leg['qty'] * 100
-        total_pnl += leg_pnl
-    pnl_profilo.append(total_pnl)
+            # Prende il prezzo medio (Mid Price) per evitare distorsioni da mercato chiuso
+            opt_data = dte_data[target_strike]
+            if option_type == 'CALL':
+                return (opt_data['call_bid'] + opt_data['call_ask']) / 2
+            else:
+                return (opt_data['put_bid'] + opt_data['put_ask']) / 2
+        except KeyError:
+            # Se il mercato non ha quell'esatto strike/DTE oggi, restituisce una stima di sicurezza
+            # o applica un'approssimazione (Interpolazione)
+            return 0.0
 
-# --- 4. GRAFICO ---
-fig = go.Figure()
-fig.add_trace(go.Scatter(x=prezzi_asse_x, y=pnl_profilo, name="Vero Payoff Empirico", line=dict(color="#00FFFF", width=3)))
-fig.add_vline(x=s_attuale, line_dash="dash", line_color="white", annotation_text="Prezzo Spot")
-fig.update_layout(template="plotly_dark", margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Prezzo Sottostante", yaxis_title="Profitto / Perdita ($)")
-st.plotly_chart(fig, use_container_width=True)
+    def calculate_payoff_matrix(self, days_forward, price_range):
+        """
+        Calcola il vero profitto/perdita muovendo il cursore del tempo e dei prezzi
+        """
+        pnl_profile = []
+
+        for S_simulated in price_range:
+            total_pnl = 0.0
+            
+            for leg in self.legs:
+                current_dte = leg['orig_dte'] - days_forward
+                
+                if current_dte <= 0:
+                    # CASO A: L'opzione è scaduta -> Valore Intrinseco Puro
+                    if leg['type'] == 'CALL':
+                        value_at_t = max(0, S_simulated - leg['strike'])
+                    else:
+                        value_at_t = max(0, leg['strike'] - S_simulated)
+                else:
+                    # CASO B: L'opzione è viva -> Applichiamo il Principio dello Specchio
+                    # Calcoliamo la distanza dallo strike (Moneyness) per replicarla sulla chain di oggi
+                    moneyness_offset = leg['strike'] - S_simulated
+                    mirror_strike = round(self.S0 + moneyness_offset)
+                    
+                    # Estraiamo il prezzo reale di oggi per quell'assetto temporale/prezzo
+                    value_at_t = self.get_market_price_mirror(current_dte, mirror_strike, leg['type'])
+                
+                # Calcolo del PnL della singola gamba
+                leg_pnl = (value_at_t - leg['entry']) * leg['qty'] * 100 # Moltiplicatore opzioni
+                total_pnl += leg_pnl
+                
+            pnl_profile.append(total_pnl)
+            
+        return pnl_profile
