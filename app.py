@@ -2,7 +2,9 @@ import streamlit as st
 import numpy as np
 import plotly.graph_objects as go
 
+# QUESTO DEVE ESSERE IL PRIMO COMANDO IN ASSOLUTO DOPO GLI IMPORT
 st.set_page_config(page_title="Empiric Payoff", layout="tight")
+
 st.title("📈 Real Payoff Simulator")
 st.subheader("Principio della Matrice Empirica")
 
