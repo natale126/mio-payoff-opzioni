@@ -3,10 +3,11 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.stats import norm
+from scipy.interpolate import interp1d
 import yfinance as yf
 from datetime import datetime, date
 
-# --- FORMULA DI BLACK-SCHOLES (Aggiornata per Call e Put) ---
+# --- FORMULA DI BLACK-SCHOLES ---
 def black_scholes(S, K, T, r, sigma, is_call=True):
     if T <= 0:
         return max(0.0, S - K) if is_call else max(0.0, K - S)
@@ -17,37 +18,73 @@ def black_scholes(S, K, T, r, sigma, is_call=True):
     else:
         return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
 
+# --- COSTRUZIONE STRUTTURA A TERMINE (IL 100% DELLA MATRICE) ---
+@st.cache_data(ttl=900, show_spinner=False)
+def costruisci_curva_volatilita(simbolo, S_attuale, scadenze):
+    dte_list = []
+    iv_list = []
+    tk = yf.Ticker(simbolo)
+    oggi = date.today()
+    
+    # Scarica le prime 15 scadenze per costruire la curva di mercato reale
+    for scad in scadenze[:15]:
+        try:
+            chain = tk.option_chain(scad)
+            calls = chain.calls
+            # Trova l'opzione At-The-Money (più vicina al prezzo attuale)
+            idx = (calls['strike'] - S_attuale).abs().argmin()
+            iv = float(calls.iloc[idx]['impliedVolatility'])
+            dte = max(1, (datetime.strptime(scad, "%Y-%m-%d").date() - oggi).days)
+            
+            if dte not in dte_list and iv > 0:
+                dte_list.append(dte)
+                iv_list.append(iv)
+        except:
+            continue
+            
+    if len(dte_list) > 1:
+        # Ordina e crea la funzione matematica che collega tutti i punti (interpolazione)
+        coppie = sorted(zip(dte_list, iv_list))
+        dte_ordinati = [p[0] for p in coppie]
+        iv_ordinate = [p[1] for p in coppie]
+        return interp1d(dte_ordinati, iv_ordinate, kind='linear', fill_value="extrapolate")
+    return None
+
 # --- CONFIGURAZIONE APPLICAZIONE ---
-st.set_page_config(page_title="Simulatore Live Opzioni", layout="wide")
-st.title("Simulatore Opzioni Live (Dati Reali di Mercato)")
-st.write("Connesso a Yahoo Finance (ritardo 15 min). Il software scarica in automatico Premi e IV reali.")
+st.set_page_config(page_title="Simulatore Opzioni PRO", layout="wide")
+st.title("Terminale Quantitativo (Matrice 100% Reale)")
+st.write("Versione definitiva: Inclusione della Struttura a Termine (Term Structure Walk) per il calcolo esatto del decadimento su scadenze multiple.")
 
 # --- SIDEBAR: CONNESSIONE DATI ---
 st.sidebar.header("1. Mercato Reale")
-simbolo = st.sidebar.text_input("Ticker Sottostante (es. SPY, AAPL, QQQ)", value="SPY").upper()
+simbolo = st.sidebar.text_input("Ticker Sottostante", value="SPY").upper()
 
-# Scarico dati del sottostante
 ticker = yf.Ticker(simbolo)
 try:
     S_attuale = ticker.fast_info['last_price']
     scadenze_disponibili = ticker.options
     if not scadenze_disponibili:
-        st.sidebar.error("Nessuna opzione trovata per questo Ticker.")
         st.stop()
-except Exception as e:
-    st.sidebar.error("Errore nel caricamento del Ticker. Verifica che esista.")
+except:
+    st.sidebar.error("Errore nel caricamento del Ticker.")
     st.stop()
 
-st.sidebar.metric(f"Prezzo Attuale {simbolo}", f"{S_attuale:.2f} $")
+st.sidebar.metric(f"Prezzo {simbolo}", f"{S_attuale:.2f} $")
 r = st.sidebar.number_input("Tasso d'Interesse (%)", value=4.0) / 100
 
 st.sidebar.markdown("---")
-st.sidebar.header("2. Impostazioni Strategia")
+st.sidebar.header("2. Setup Strategia")
 num_gambe = st.sidebar.selectbox("Numero di Gambe", [1, 2, 3, 4], index=3)
-attiva_matrice = st.sidebar.checkbox("Attiva Matrice (Blocca IV Lunghe)", value=True)
+attiva_matrice = st.sidebar.checkbox("Attiva Matrice 100% (Usa Term Structure Reale)", value=True, help="Disattivalo per usare il calcolo stupido dei classici broker (OptionStrat).")
+
+# Inizializzazione della Curva di Volatilità in background
+curva_iv = None
+if attiva_matrice:
+    with st.spinner("Estrazione Term Structure dal mercato in corso..."):
+        curva_iv = costruisci_curva_volatilita(simbolo, S_attuale, scadenze_disponibili)
 
 # --- INSERIMENTO GAMBE CON DATI LIVE ---
-st.header("Configurazione Live delle Gambe")
+st.header("Configurazione Gambe")
 colonne_UI = st.columns(num_gambe)
 gambe = []
 
@@ -56,33 +93,25 @@ def input_gamba_live(col, id_gamba):
         st.subheader(f"Gamba {id_gamba}")
         tipo_azione = st.selectbox(f"Azione", ["VENDUTA (Short)", "COMPRATA (Long)"], key=f"t_az_{id_gamba}")
         tipo_opzione = st.selectbox(f"Tipo", ["Call", "Put"], key=f"t_op_{id_gamba}")
+        scadenza = st.selectbox(f"Scadenza", scadenze_disponibili, key=f"scad_{id_gamba}")
         
-        # Scelta Data Reale
-        scadenza = st.selectbox(f"Scadenza Reale", scadenze_disponibili, key=f"scad_{id_gamba}")
-        
-        # Calcolo DTE automatico
         oggi = date.today()
         data_scadenza = datetime.strptime(scadenza, "%Y-%m-%d").date()
-        dte_iniziale = (data_scadenza - oggi).days
-        if dte_iniziale <= 0: dte_iniziale = 1 # Evita errori alla data di scadenza
+        dte_iniziale = max(1, (data_scadenza - oggi).days)
         
-        # Scarica la Option Chain reale per quella data
-        with st.spinner("Scaricamento dati mercato..."):
-            chain = ticker.option_chain(scadenza)
-            df_opzioni = chain.calls if tipo_opzione == "Call" else chain.puts
+        chain = ticker.option_chain(scadenza)
+        df_opzioni = chain.calls if tipo_opzione == "Call" else chain.puts
         
-        # Estrae gli strike disponibili sul mercato e trova il più vicino al prezzo attuale
         strikes = df_opzioni['strike'].tolist()
         strike_default_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - S_attuale))
         strike = st.selectbox(f"Strike", strikes, index=strike_default_idx, key=f"k_{id_gamba}")
         
-        # Cattura Premio (Ultimo Prezzo) e IV Reale dal DataFrame di yfinance
         dati_strike = df_opzioni[df_opzioni['strike'] == strike].iloc[0]
         premio_reale = float(dati_strike['lastPrice'])
         iv_reale = float(dati_strike['impliedVolatility'])
         
-        st.metric("Premio Mercato (Last)", f"{premio_reale:.2f} $")
-        st.metric("IV Mercato (Reale)", f"{iv_reale*100:.2f} %")
+        st.metric("Premio (Last)", f"{premio_reale:.2f} $")
+        st.metric("IV Reale", f"{iv_reale*100:.2f} %")
         
         gambe.append({
             "id": id_gamba,
@@ -101,7 +130,7 @@ for i in range(num_gambe):
 min_dte = min([g["dte_iniziale"] for g in gambe])
 
 # --- CURSORI INTERATTIVI ---
-st.header("Simulazione Dinamica (Stress Test)")
+st.header("Macchina del Tempo & Stress Test")
 col_slide1, col_slide2, col_slide3 = st.columns(3)
 with col_slide1:
     giorni_passati = st.slider("Giorni Trascorsi", min_value=0, max_value=int(max([g["dte_iniziale"] for g in gambe])), value=0, step=1)
@@ -109,12 +138,12 @@ with col_slide2:
     shock_iv_breve = st.slider("Shock IV Scadenze Brevi (%)", min_value=-20, max_value=20, value=0, step=1) / 100
 with col_slide3:
     if attiva_matrice:
-        st.slider("Shock IV Scadenze Lunghe (%)", min_value=-20, max_value=20, value=0, disabled=True, help="Bloccato dalla Matrice per usare la Volatilità Strutturale")
+        st.slider("Shock IV Scadenze Lunghe (%)", value=0, disabled=True, help="Lucchetto Matrice: Le lunghe seguono la curva naturale del mercato.")
         shock_iv_lunga = 0.0
     else:
         shock_iv_lunga = st.slider("Shock IV Scadenze Lunghe (%)", min_value=-20, max_value=20, value=0, step=1) / 100
 
-# --- MOTORE DI CALCOLO P&L ---
+# --- MOTORE DI CALCOLO 100% REALE ---
 prezzi_target = np.linspace(S_attuale * 0.90, S_attuale * 1.10, 200)
 pnl_simulato = []
 dati_tabella = []
@@ -124,31 +153,50 @@ for g in gambe:
     dte_rimanenti = max(0.001, g["dte_iniziale"] - giorni_passati)
     t_rimanente = dte_rimanenti / 365.0
     
-    if attiva_matrice:
-        iv_simulata = max(0.01, g["iv_iniziale"] + shock_iv_breve) if g["dte_iniziale"] == min_dte else g["iv_iniziale"]
+    # LA VERA MAGIA DEL TRADE PARTNER
+    if attiva_matrice and curva_iv is not None:
+        # Calcola la differenza tra l'IV di questa specifica opzione e l'IV base del mercato oggi
+        iv_base_iniziale = float(curva_iv(g["dte_iniziale"]))
+        spread_volatilita = g["iv_iniziale"] - iv_base_iniziale
+        
+        # Trova la nuova IV base sulla curva corrispondente ai giorni rimasti
+        nuova_iv_base = float(curva_iv(dte_rimanenti))
+        
+        # Somma la nuova base allo spread originario (protegge il Volatility Smile)
+        iv_strutturale = nuova_iv_base + spread_volatilita
+        
+        # Applica lo stress test solo alle brevi
+        iv_simulata = max(0.01, iv_strutturale + shock_iv_breve) if g["dte_iniziale"] == min_dte else max(0.01, iv_strutturale)
     else:
+        # Metodo stupido OptionStrat
         iv_simulata = max(0.01, g["iv_iniziale"] + (shock_iv_breve if g["dte_iniziale"] == min_dte else shock_iv_lunga))
     
-    prezzo_teorico_corrente = black_scholes(S_attuale, g["strike"], t_rimanente, r, iv_simulata, g["is_call"])
-    ppg_dinamico = prezzo_teorico_corrente / dte_rimanenti
+    prezzo_teorico = black_scholes(S_attuale, g["strike"], t_rimanente, r, iv_simulata, g["is_call"])
+    ppg_dinamico = prezzo_teorico / dte_rimanenti
     ppg_netto_simulato += ppg_dinamico * (-g["tipo"])
-    pnl_gamba = (prezzo_teorico_corrente - g["premio_apertura"]) * g["tipo"] * 100
+    pnl_gamba = (prezzo_teorico - g["premio_apertura"]) * g["tipo"] * 100
     
     dati_tabella.append({
         "Gamba": f"G{g['id']} ({g['tipo_testo']} { 'Call' if g['is_call'] else 'Put' })",
-        "Strike": g["strike"],
         "DTE Residui": int(dte_rimanenti),
-        "Valore Attuale ($)": round(prezzo_teorico_corrente, 2),
-        "P&L Gamba ($)": round(pnl_gamba, 2)
+        "IV Usata (%)": round(iv_simulata * 100, 2),
+        "Valore ($)": round(prezzo_teorico, 2),
+        "P&L ($)": round(pnl_gamba, 2)
     })
 
+# Calcolo curva grafico
 for S_sim in prezzi_target:
     pnl_totale_nodo = 0
     for g in gambe:
         dte_rimanenti = max(0.001, g["dte_iniziale"] - giorni_passati)
         t_rimanente = dte_rimanenti / 365.0
-        if attiva_matrice:
-            iv_simulata = g["iv_iniziale"] if g["dte_iniziale"] != min_dte else max(0.01, g["iv_iniziale"] + shock_iv_breve)
+        
+        if attiva_matrice and curva_iv is not None:
+            iv_base_iniziale = float(curva_iv(g["dte_iniziale"]))
+            spread_volatilita = g["iv_iniziale"] - iv_base_iniziale
+            nuova_iv_base = float(curva_iv(dte_rimanenti))
+            iv_strutturale = nuova_iv_base + spread_volatilita
+            iv_simulata = max(0.01, iv_strutturale + shock_iv_breve) if g["dte_iniziale"] == min_dte else max(0.01, iv_strutturale)
         else:
             iv_simulata = max(0.01, g["iv_iniziale"] + (shock_iv_breve if g["dte_iniziale"] == min_dte else shock_iv_lunga))
             
