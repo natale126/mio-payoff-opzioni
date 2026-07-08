@@ -53,7 +53,7 @@ def costruisci_curva_volatilita(simbolo, S_attuale, scadenze):
 # --- CONFIGURAZIONE APPLICAZIONE ---
 st.set_page_config(page_title="Simulatore Opzioni PRO", layout="wide")
 st.title("Terminale Quantitativo (Matrice 100% Reale)")
-st.write("Versione definitiva: Inclusione della Struttura a Termine (Term Structure Walk) per il calcolo esatto del decadimento su scadenze multiple.")
+st.write("Versione definitiva: Calcolo istituzionale su Mid Price e Struttura a Termine.")
 
 # --- SIDEBAR: CONNESSIONE DATI ---
 st.sidebar.header("1. Mercato Reale")
@@ -75,7 +75,7 @@ r = st.sidebar.number_input("Tasso d'Interesse (%)", value=4.0) / 100
 st.sidebar.markdown("---")
 st.sidebar.header("2. Setup Strategia")
 num_gambe = st.sidebar.selectbox("Numero di Gambe", [1, 2, 3, 4], index=3)
-attiva_matrice = st.sidebar.checkbox("Attiva Matrice 100% (Usa Term Structure Reale)", value=True, help="Disattivalo per usare il calcolo stupido dei classici broker (OptionStrat).")
+attiva_matrice = st.sidebar.checkbox("Attiva Matrice 100% (Usa Term Structure Reale)", value=True, help="Disattivalo per usare il calcolo stupido dei classici broker.")
 
 # Inizializzazione della Curva di Volatilità in background
 curva_iv = None
@@ -107,10 +107,19 @@ def input_gamba_live(col, id_gamba):
         strike = st.selectbox(f"Strike", strikes, index=strike_default_idx, key=f"k_{id_gamba}")
         
         dati_strike = df_opzioni[df_opzioni['strike'] == strike].iloc[0]
-        premio_reale = float(dati_strike['lastPrice'])
+        
+        # NUOVO BLOCCO: CALCOLO DEL MID PRICE AL POSTO DEL LAST PRICE
+        bid = float(dati_strike['bid'])
+        ask = float(dati_strike['ask'])
+        # Se c'è un errore nei dati e mancano bid/ask, usa il last price come rete di sicurezza
+        if bid == 0.0 and ask == 0.0:
+            premio_reale = float(dati_strike['lastPrice'])
+        else:
+            premio_reale = (bid + ask) / 2
+            
         iv_reale = float(dati_strike['impliedVolatility'])
         
-        st.metric("Premio (Last)", f"{premio_reale:.2f} $")
+        st.metric("Premio (Mid)", f"{premio_reale:.2f} $")
         st.metric("IV Reale", f"{iv_reale*100:.2f} %")
         
         gambe.append({
@@ -153,22 +162,13 @@ for g in gambe:
     dte_rimanenti = max(0.001, g["dte_iniziale"] - giorni_passati)
     t_rimanente = dte_rimanenti / 365.0
     
-    # LA VERA MAGIA DEL TRADE PARTNER
     if attiva_matrice and curva_iv is not None:
-        # Calcola la differenza tra l'IV di questa specifica opzione e l'IV base del mercato oggi
         iv_base_iniziale = float(curva_iv(g["dte_iniziale"]))
         spread_volatilita = g["iv_iniziale"] - iv_base_iniziale
-        
-        # Trova la nuova IV base sulla curva corrispondente ai giorni rimasti
         nuova_iv_base = float(curva_iv(dte_rimanenti))
-        
-        # Somma la nuova base allo spread originario (protegge il Volatility Smile)
         iv_strutturale = nuova_iv_base + spread_volatilita
-        
-        # Applica lo stress test solo alle brevi
         iv_simulata = max(0.01, iv_strutturale + shock_iv_breve) if g["dte_iniziale"] == min_dte else max(0.01, iv_strutturale)
     else:
-        # Metodo stupido OptionStrat
         iv_simulata = max(0.01, g["iv_iniziale"] + (shock_iv_breve if g["dte_iniziale"] == min_dte else shock_iv_lunga))
     
     prezzo_teorico = black_scholes(S_attuale, g["strike"], t_rimanente, r, iv_simulata, g["is_call"])
